@@ -5,18 +5,151 @@ import time
 import random
 import json
 from datetime import datetime
+import urllib.parse
 
-def search_gunbroker(manufacturer, model, caliber):
+def search_armslist(manufacturer, model, caliber, location="usa", category="all"):
+    """
+    Search Armslist for current listings matching the firearm details
+    Returns a list of dictionaries with listing information
+    """
+    try:
+        # Build the search query
+        search_query = f"{manufacturer} {model} {caliber}".strip()
+        
+        # URL encode the search query
+        encoded_query = urllib.parse.quote(search_query)
+        
+        # Construct the Armslist search URL
+        url = f"https://www.armslist.com/classifieds/search?search={encoded_query}&location={location}&category={category}&posttype=7&ships=&ispowersearch=1&hs=1"
+        
+        print(f"Searching Armslist for: {search_query}")
+        print(f"URL: {url}")
+        
+        # Set headers to mimic a browser request
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
+        
+        # Send the request to Armslist
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        # Check if the request was successful
+        if response.status_code != 200:
+            print(f"Error: Received status code {response.status_code}")
+            return []
+        
+        # Parse the HTML content
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Find all listing items
+        listings = []
+        
+        # The search results appear to be in sections for "Near Match Records" and "Related Match Records"
+        # Look for listing elements that have class attributes consistent with listings
+        listing_elements = soup.find_all('div', class_=lambda c: c and 'listing' in c.lower())
+        
+        if not listing_elements:
+            # Fall back to a more generic approach if class-based search fails
+            listing_elements = soup.find_all('div', class_=lambda c: c and ('item' in c.lower() or 'product' in c.lower()))
+        
+        for item in listing_elements:
+            try:
+                # Extract listing data
+                title_element = item.find('h3') or item.find('h2')
+                title = title_element.text.strip() if title_element else "No Title"
+                
+                # Try to find the price
+                price_element = item.find('span', class_=lambda c: c and 'price' in c.lower()) or item.find('div', class_=lambda c: c and 'price' in c.lower())
+                price_text = price_element.text.strip() if price_element else "Price not listed"
+                
+                # Clean up the price text and convert to float if possible
+                price = None
+                if price_text and '$' in price_text:
+                    price_str = re.sub(r'[^\d.]', '', price_text)
+                    try:
+                        price = float(price_str)
+                    except ValueError:
+                        price = None
+                
+                # Try to find the link
+                link_element = item.find('a', href=True)
+                link = "https://www.armslist.com" + link_element['href'] if link_element and link_element.get('href', '').startswith('/') else link_element.get('href', '#') if link_element else "#"
+                
+                # Try to find the location
+                location_element = item.find('div', class_=lambda c: c and 'location' in c.lower())
+                location = location_element.text.strip() if location_element else "Location not specified"
+                
+                # Try to find if it will ship
+                ships_element = item.find('span', class_=lambda c: c and 'ship' in c.lower())
+                ships = True if ships_element and ships_element.text.strip().lower() == 'will ship' else False
+                
+                # Compile the listing data
+                listing = {
+                    'title': title,
+                    'price': price,
+                    'price_text': price_text,
+                    'link': link,
+                    'location': location,
+                    'ships': ships,
+                    'source': 'Armslist'
+                }
+                
+                listings.append(listing)
+            except Exception as e:
+                print(f"Error parsing listing: {e}")
+                continue
+        
+        print(f"Found {len(listings)} listings on Armslist")
+        return listings
+    
+    except Exception as e:
+        print(f"Error searching Armslist: {e}")
+        return []
+
+def get_market_listings(manufacturer, model, caliber):
+    """
+    Get current market listings from various sources
+    Returns a list of dictionaries with listing information
+    """
+    # Add a small delay to prevent aggressive scraping
+    time.sleep(random.uniform(0.5, 1.5))
+    
+    # Search Armslist
+    armslist_results = search_armslist(manufacturer, model, caliber)
+    
+    # Combine results from different sources (currently just Armslist)
+    all_listings = armslist_results
+    
+    # Sort listings by price (lowest first)
+    if all_listings:
+        all_listings = sorted([l for l in all_listings if l.get('price') is not None], key=lambda x: x['price'])
+        
+        # Calculate average price if we have enough data
+        if len(all_listings) >= 3:
+            prices = [l.get('price') for l in all_listings if l.get('price') is not None]
+            avg_price = sum(prices) / len(prices) if prices else None
+            
+            # Add average price to the results
+            for listing in all_listings:
+                listing['avg_price'] = avg_price
+    
+    return all_listings
+
+def estimate_market_value(manufacturer, model, caliber):
     """
     Estimate firearm value based on typical market prices
     Returns a tuple of (avg_price, price_range, sample_size)
     
-    Note: Due to anti-scraping protections on GunBroker, we use an alternative approach
-    that estimates values based on market knowledge and patterns.
+    Uses a data-driven algorithm based on market knowledge and pricing patterns
+    to estimate the value of firearms without external API calls.
     """
     try:
-        # Instead of scraping (which is blocked), we'll use a smarter estimation algorithm
-        # based on manufacturer, model, and caliber
+        # Use a market-based estimation algorithm based on manufacturer, model, and caliber
         
         print(f"Estimating value for: {manufacturer} {model} {caliber}")
         
@@ -118,6 +251,9 @@ def search_gunbroker(manufacturer, model, caliber):
                 model_factor *= 1.5  # Highly desirable
             elif "1911" in model_upper:
                 model_factor *= 1.2
+        elif mfg_upper == "TAURUS":
+            if "PT22" in model_upper or "PT-22" in model_upper:
+                model_factor *= 0.85  # Less popular pocket pistol
         
         # Calculate estimated price
         estimated_price = base_price * caliber_factor * model_factor
@@ -136,26 +272,74 @@ def search_gunbroker(manufacturer, model, caliber):
         print(f"Error estimating value: {e}")
         return None
 
-def estimate_value(manufacturer, model, caliber):
+def estimate_value(manufacturer, model, caliber, use_online_sources=False):
     """
     Main function to estimate the value of a firearm
     Returns a dictionary with value information
+    
+    Parameters:
+    - manufacturer: The firearm manufacturer
+    - model: The firearm model
+    - caliber: The firearm caliber
+    - use_online_sources: Whether to also search online marketplaces for current listings
     """
     # Add a small delay to simulate processing
     time.sleep(random.uniform(0.2, 0.5))
     
-    # Get the estimated value
-    result = search_gunbroker(manufacturer, model, caliber)
+    # Get market listings if requested
+    market_listings = []
+    if use_online_sources:
+        market_listings = get_market_listings(manufacturer, model, caliber)
+    
+    # Get the algorithmic estimated value
+    result = estimate_market_value(manufacturer, model, caliber)
     
     if result:
         avg_price, price_range, _ = result
-        return {
+        
+        # If we have online listings with prices, adjust our estimate
+        if market_listings and any(l.get('price') for l in market_listings):
+            valid_prices = [l.get('price') for l in market_listings if l.get('price') is not None]
+            if valid_prices:
+                online_avg = sum(valid_prices) / len(valid_prices)
+                # Blend algorithmic estimate with online prices (70% online, 30% algorithm)
+                if online_avg > 0:
+                    blended_price = (online_avg * 0.7) + (avg_price * 0.3)
+                    # Adjust the range accordingly
+                    range_adjustment = abs(blended_price - avg_price) / avg_price
+                    new_range_low = blended_price * (0.85 - range_adjustment/2)
+                    new_range_high = blended_price * (1.15 + range_adjustment/2)
+                    
+                    avg_price = blended_price
+                    price_range = (new_range_low, new_range_high)
+        
+        value_info = {
             "estimated_value": avg_price,
             "value_range": price_range,
-            "sample_size": "N/A",
-            "source": "Market Estimator",
-            "confidence": "medium"
+            "sample_size": len(market_listings) if market_listings else "N/A",
+            "source": "Market Estimator" if not market_listings else f"Market Estimator + {len(market_listings)} Online Listings",
+            "confidence": "medium" if not market_listings else "high",
+            "market_listings": market_listings if market_listings else []
         }
+        
+        return value_info
+    
+    # If no algorithm result but we have market listings
+    if market_listings and any(l.get('price') for l in market_listings):
+        valid_prices = [l.get('price') for l in market_listings if l.get('price') is not None]
+        if valid_prices:
+            online_avg = sum(valid_prices) / len(valid_prices)
+            range_low = min(valid_prices)
+            range_high = max(valid_prices)
+            
+            return {
+                "estimated_value": online_avg,
+                "value_range": (range_low, range_high),
+                "sample_size": len(valid_prices),
+                "source": f"Online Listings ({len(valid_prices)} samples)",
+                "confidence": "medium",
+                "market_listings": market_listings
+            }
     
     # If no result found
     return {
@@ -163,5 +347,6 @@ def estimate_value(manufacturer, model, caliber):
         "value_range": None,
         "sample_size": 0,
         "source": "No data available",
-        "confidence": "none"
+        "confidence": "none",
+        "market_listings": []
     } 

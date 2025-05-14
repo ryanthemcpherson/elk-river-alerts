@@ -33,14 +33,35 @@ def parse_table(table, section):
         ))
     return listings
 
-def scrape_used_guns():
+def scrape_used_guns(progress_callback=None):
+    """
+    Scrape used firearms listings from Elk River Guns website
+    
+    Args:
+        progress_callback: Optional callback function to report progress
+                          Function should accept (stage, message, percent) parameters
+    
+    Returns:
+        List of FirearmListing objects
+    """
+    # Report progress if a callback is provided
+    if progress_callback:
+        progress_callback("scraping", "Connecting to Elk River Guns website...", 0)
+    
     url = "https://elkriverguns.com/used-guns/"
     resp = requests.get(url)
+    
+    if progress_callback:
+        progress_callback("scraping", "Parsing webpage content...", 10)
+    
     soup = BeautifulSoup(resp.text, "html.parser")
     all_listings = []
     
     # Find all tables on the page
     tables = soup.find_all('table')
+    
+    if progress_callback:
+        progress_callback("scraping", "Finding firearm sections...", 20)
     
     # Find section headers for tables
     sections = {
@@ -62,14 +83,28 @@ def scrape_used_guns():
         elif 'Shotguns' in header_text:
             sections['Shotguns'] = header
     
+    # Track progress through section parsing
+    total_sections = len([s for s in sections.values() if s is not None])
+    current_section = 0
+    
     # Match tables to section headers
     for section_name, section_header in sections.items():
         if section_header:
+            # Report progress
+            if progress_callback:
+                current_section += 1
+                progress_percent = 30 + (60 * current_section / total_sections)
+                progress_callback("scraping", f"Parsing {section_name} listings...", int(progress_percent))
+            
             # Find the table that follows this header
             table = section_header.find_next('table')
             if table:
                 listings = parse_table(table, section_name)
                 all_listings.extend(listings)
+    
+    # Final progress update
+    if progress_callback:
+        progress_callback("scraping", f"Found {len(all_listings)} firearms", 100)
     
     return all_listings
 

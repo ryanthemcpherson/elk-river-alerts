@@ -8,6 +8,8 @@ from supabase import create_client
 import price_analysis
 import altair as alt
 import hashlib
+import json
+import urllib.parse
 
 # Cache the connection
 @st.cache_resource
@@ -60,12 +62,32 @@ def store_listings(listings):
     db_records = []
     current_time = datetime.now().isoformat()
     
-    for l in listings:
+    # Define max length for varchar fields to prevent DB errors
+    VARCHAR_LIMITS = {
+        "section": 30,
+        "manufacturer": 30,
+        "model": 30,
+        "caliber": 30,
+        "value_source": 30
+    }
+    
+    # Create a progress bar
+    progress_bar = st.progress(0)
+    total_listings = len(listings)
+    
+    # Process each listing with a progress indicator
+    for i, l in enumerate(listings):
+        # Update progress bar
+        progress_percent = int(100 * (i / total_listings))
+        progress_bar.progress(progress_percent, text=f"Processing {i+1}/{total_listings}: {l.manufacturer} {l.model}")
+        
         # Generate a unique hash for this listing
         listing_hash = generate_listing_hash(l)
         
         # Get value estimate
-        value_info = estimate_value(l.manufacturer, l.model, l.caliber)
+        # Enable online sources for more accuracy - this will search Armslist
+        use_online = st.session_state.get('use_online_sources', False)
+        value_info = estimate_value(l.manufacturer, l.model, l.caliber, use_online_sources=use_online)
         
         # Calculate price difference if we have an estimated value
         price_difference = None
@@ -75,16 +97,16 @@ def store_listings(listings):
             price_difference = l.price - value_info["estimated_value"]
             price_difference_percent = (price_difference / value_info["estimated_value"]) * 100
         
-        # Create record for database
+        # Create record for database - truncate fields to prevent varchar limit errors
         record = {
-            "section": l.section,
-            "manufacturer": l.manufacturer,
-            "model": l.model,
-            "caliber": l.caliber,
+            "section": l.section[:VARCHAR_LIMITS["section"]] if l.section else None,
+            "manufacturer": l.manufacturer[:VARCHAR_LIMITS["manufacturer"]] if l.manufacturer else None,
+            "model": l.model[:VARCHAR_LIMITS["model"]] if l.model else None,
+            "caliber": l.caliber[:VARCHAR_LIMITS["caliber"]] if l.caliber else None,
             "list_price": l.price,
-            "description": l.description,
+            "description": l.description,  # Description might have a different limit, often TEXT type
             "estimated_value": value_info["estimated_value"],
-            "value_source": value_info["source"],
+            "value_source": value_info["source"][:VARCHAR_LIMITS["value_source"]] if value_info["source"] else None,
             "value_confidence": value_info["confidence"],
             "price_difference": price_difference,
             "price_difference_percent": price_difference_percent,
@@ -97,6 +119,11 @@ def store_listings(listings):
         if value_info["value_range"]:
             record["value_range_low"] = value_info["value_range"][0]
             record["value_range_high"] = value_info["value_range"][1]
+        
+        # Add market listings data if available (as JSON)
+        if value_info.get("market_listings"):
+            record["market_listings_json"] = json.dumps(value_info["market_listings"])
+            record["market_listings_count"] = len(value_info["market_listings"])
         
         db_records.append(record)
     
@@ -132,6 +159,9 @@ def inventory_page():
     
     # Convert database records to DataFrame for easier filtering
     df = pd.DataFrame(db_listings)
+    
+    # Check if the required columns exist
+    has_market_listings = 'market_listings_count' in df.columns and 'market_listings_json' in df.columns
     
     # Extract section types for filtering
     df['section_type'] = df['section'].apply(lambda x: x.split()[0] if ' ' in x else x)
@@ -192,6 +222,15 @@ def inventory_page():
             lambda row: format_price_comparison(row['price_difference'], row['price_difference_percent']), axis=1
         )
         
+        # Add online listings indicator only if the columns exist
+        if has_market_listings:
+            has_listings = df.apply(
+                lambda row: "✓" if pd.notna(row.get('market_listings_count')) and row['market_listings_count'] > 0 else "", 
+                axis=1
+            )
+            if df['market_listings_count'].sum() > 0:
+                display_df["Online Listings"] = has_listings
+        
         # Create expandable section for explanation
         with st.expander("About Value Estimates"):
             st.markdown("""
@@ -229,6 +268,13 @@ def inventory_page():
             "Description": st.column_config.TextColumn("Description", help="Listing description")
         }
         
+        # Add online listings column config if applicable
+        if 'Online Listings' in display_df.columns:
+            column_config["Online Listings"] = st.column_config.TextColumn(
+                "Online Listings", 
+                help="Click to view current online marketplace listings for this firearm"
+            )
+        
         # Display the dataframe with the column configuration
         st.dataframe(
             display_df, 
@@ -236,6 +282,72 @@ def inventory_page():
             hide_index=True,
             column_config=column_config
         )
+        
+        # Note: In Streamlit 1.20.0+, getting selected rows requires a different approach
+        # For now, let's comment out the selection functionality since it's causing an error
+        
+        # Display a message about the market listings if they exist
+        if has_market_listings:
+            st.info("To view online marketplace listings for a specific firearm, search for the manufacturer and model in the search box above.")
+            
+            # Optional: Add a selector to let users pick a firearm to view listings for
+            if len(df) > 0:
+                firearm_options = [f"{row['manufacturer']} {row['model']} {row['caliber']}" for _, row in df.iterrows() if pd.notna(row.get('market_listings_json'))]
+                
+                if firearm_options:
+                    st.subheader("Online Marketplace Listings")
+                    selected_firearm = st.selectbox("Select a firearm to view online listings:", ["Select..."] + firearm_options)
+                    
+                    if selected_firearm != "Select...":
+                        # Find the matching row
+                        for idx, row in df.iterrows():
+                            firearm = f"{row['manufacturer']} {row['model']} {row['caliber']}"
+                            if firearm == selected_firearm and pd.notna(row.get('market_listings_json')):
+                                try:
+                                    # Parse the JSON string to get the listings
+                                    market_listings = json.loads(row['market_listings_json'])
+                                    
+                                    if market_listings:
+                                        st.markdown(f"### Current listings for {firearm}")
+                                        
+                                        # Create a DataFrame to display the listings
+                                        listings_df = pd.DataFrame([
+                                            {
+                                                "Title": l.get('title', 'No Title'),
+                                                "Price": l.get('price_text', 'Price not listed'),
+                                                "Location": l.get('location', 'Not specified'),
+                                                "Ships": "Yes" if l.get('ships', False) else "No",
+                                                "Source": l.get('source', 'Unknown')
+                                            }
+                                            for l in market_listings
+                                        ])
+                                        
+                                        # Display the listings
+                                        st.dataframe(listings_df, use_container_width=True, hide_index=True)
+                                        
+                                        # Add a link to the original search
+                                        search_query = f"{row['manufacturer']} {row['model']} {row['caliber']}".strip()
+                                        encoded_query = urllib.parse.quote(search_query)
+                                        armslist_url = f"https://www.armslist.com/classifieds/search?search={encoded_query}&location=usa&category=all&posttype=7&ships=&ispowersearch=1&hs=1"
+                                        
+                                        st.markdown(f"[View more listings on Armslist]({armslist_url})")
+                                except Exception as e:
+                                    st.error(f"Error displaying online listings: {e}")
+        
+        # If market listing columns don't exist, show a message
+        if not has_market_listings and st.session_state.get('use_online_sources', False):
+            st.warning("""
+            **Database Update Required**: To use online marketplace data, you need to update your database schema.
+            
+            Run the migration script to add the required columns:
+            ```
+            python db_migration.py --add-market-columns
+            ```
+            
+            Or add the columns manually through the Supabase console:
+            - market_listings_json (JSONB)
+            - market_listings_count (INTEGER)
+            """)
     else:
         st.info("No listings found for the selected criteria.")
 
@@ -476,7 +588,8 @@ def main():
     # Add a title and description
     st.title("Elk River Used Guns Inventory")
     st.markdown("This app tracks inventory and estimates market values for used firearms at Elk River Guns.")
-    
+    st.markdown("This app is not affiliated with Elk River Guns. It is a personal project to help track the market value of used firearms.")
+    st.link_button("Elk River Guns", "https://elkriverguns.com/used-guns")
     # Check when data was last scraped
     last_scrape_time = get_last_scrape_time()
     
@@ -487,26 +600,74 @@ def main():
     # Add refresh button in sidebar
     with st.sidebar:
         refresh = st.button("Refresh Data")
+        
+        # Add a separator
+        st.markdown("---")
+        
+        # Add option to enable online sources
+        st.subheader("Market Data Settings")
+        # Initialize the session state if not already done
+        if 'use_online_sources' not in st.session_state:
+            st.session_state.use_online_sources = False
+        
+        use_online = st.checkbox(
+            "Use online marketplace data", 
+            value=st.session_state.use_online_sources,
+            help="When enabled, the app will search online marketplaces like Armslist for current listings. This may slow down data refresh."
+        )
+        
+        # Update session state if changed
+        if use_online != st.session_state.use_online_sources:
+            st.session_state.use_online_sources = use_online
+            # If settings changed, suggest a refresh
+            st.info("Online market data settings changed. Please refresh the data to apply changes.")
     
     # Determine if we need to fetch new data
     needs_update = refresh or not last_scrape_time
     
     # If data needs to be refreshed, scrape new data
     if needs_update:
-        with st.spinner("Fetching latest inventory from Elk River Guns..."):
-            # Scrape new data
-            listings = scrape_used_guns()
+        # Create a status container to show overall progress
+        with st.status("Data Refresh Process", expanded=True) as status:
+            status.update(label="Step 1/3: Fetching latest inventory from Elk River Guns...", state="running")
+            
+            # Create a progress bar for the scraping process
+            scrape_progress_bar = st.progress(0, text="Starting data collection...")
+            
+            # Define a callback function to update the progress bar during scraping
+            def update_scrape_progress(stage, message, percent):
+                scrape_progress_bar.progress(percent, text=message)
+                if percent >= 100:
+                    time.sleep(0.5)  # Give a moment to see 100%
+            
+            # Scrape new data with progress updates
+            listings = scrape_used_guns(progress_callback=update_scrape_progress)
             
             if listings:
-                # Show progress for value estimation
-                progress_text = "Estimating market values for firearms..."
-                with st.status(progress_text) as status:
-                    total_stored = store_listings(listings)
-                    status.update(label=f"Updated database with {total_stored} firearms", state="complete")
+                # Update status for the next phase
+                status.update(label=f"Step 2/3: Processing {len(listings)} firearms and estimating market values...", state="running")
+                
+                # Remove the scraping progress bar and add a message about found firearms
+                scrape_progress_bar.empty()
+                st.success(f"Found {len(listings)} firearms at Elk River Guns")
+                
+                # Process data and store in database
+                total_stored = store_listings(listings)
+                
+                # Update status one more time
+                status.update(label=f"Step 3/3: Finalizing database update...", state="running")
                 
                 # Refresh last scrape time
                 last_scrape_time = get_last_scrape_time()
-                st.sidebar.success(f"Data refreshed successfully!")
+                
+                # Complete the status
+                status.update(label=f"✅ Complete! Updated database with {total_stored} firearms.", state="complete")
+                
+                # Also show a success message in the sidebar
+                st.sidebar.success(f"Data refreshed successfully! Added {total_stored} firearms.")
+            else:
+                status.update(label="❌ Error: Could not retrieve inventory data from Elk River Guns.", state="error")
+                st.error("Failed to fetch data from Elk River Guns. Please try again later.")
     
     # Create tabs for different pages
     tab1, tab2 = st.tabs(["Inventory", "Analytics"])
