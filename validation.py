@@ -291,7 +291,6 @@ class InputValidator:
             errors.append(f"Condition: {condition_result.error_message}")
         else:
             cleaned_data['condition'] = condition_result.cleaned_value
-        
         # Validate section
         section_result = cls.validate_section(listing_data.get('section', ''))
         if not section_result.is_valid:
