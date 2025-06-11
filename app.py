@@ -11,7 +11,10 @@ from supabase import create_client
 
 import price_analysis
 from firearm_values import estimate_value
-from main import scrape_used_guns
+from main import scrape_all_guns
+from concurrent_estimator import ConcurrentValueEstimator, create_estimation_tasks
+from cache_manager import get_market_cache
+from validation import InputValidator
 
 
 # Cache the connection
@@ -60,12 +63,13 @@ def mark_listings_as_not_latest():
 def generate_listing_hash(listing):
     """Generate a unique hash for a listing to identify duplicates"""
     # Create a string that uniquely identifies this firearm
-    unique_str = f"{listing.manufacturer}|{listing.model}|{listing.caliber}|{listing.price}|{listing.description}"
+    # Include condition to differentiate between new and used guns with same specs
+    unique_str = f"{listing.manufacturer}|{listing.model}|{listing.caliber}|{listing.price}|{listing.description}|{listing.condition}"
     # Generate a hash
     return hashlib.md5(unique_str.encode()).hexdigest()
 
 
-def store_listings(listings):
+def store_listings(listings, max_workers=4, enable_caching=True):
     """Store listings in the database with value estimates, preventing duplicates"""
     supabase = get_connection()
 
@@ -85,70 +89,220 @@ def store_listings(listings):
         "value_source": 30,
     }
 
-    # Create a progress bar
-    progress_bar = st.progress(0)
-    total_listings = len(listings)
+    use_online = st.session_state.get("use_online_sources", False)
 
-    # Process each listing with a progress indicator
-    for i, l in enumerate(listings):
-        # Update progress bar
-        progress_percent = int(100 * (i / total_listings))
-        progress_bar.progress(
-            progress_percent,
-            text=f"Processing {i + 1}/{total_listings}: {l.manufacturer} {l.model}",
+    # Show cache statistics
+    if enable_caching:
+        cache = get_market_cache()
+        cache_stats = cache.get_cache_stats()
+        st.info(
+            f"Cache: {cache_stats['memory_entries']} in memory, {cache_stats['file_entries']} on disk"
         )
 
-        # Generate a unique hash for this listing
-        listing_hash = generate_listing_hash(l)
-
-        # Get value estimate
-        # Enable online sources for more accuracy - this will search Armslist
-        use_online = st.session_state.get("use_online_sources", False)
-        value_info = estimate_value(
-            l.manufacturer, l.model, l.caliber, use_online_sources=use_online
+    if use_online and len(listings) > 10:
+        # Use concurrent processing for larger datasets
+        st.info(
+            f"🚀 Using concurrent processing with {max_workers} workers for faster value estimation..."
         )
 
-        # Calculate price difference if we have an estimated value
-        price_difference = None
-        price_difference_percent = None
+        # Create progress bars
+        overall_progress = st.progress(0)
+        detail_progress = st.empty()
 
-        if value_info["estimated_value"]:
-            price_difference = l.price - value_info["estimated_value"]
-            price_difference_percent = (price_difference / value_info["estimated_value"]) * 100
+        # Create estimation tasks
+        tasks = create_estimation_tasks(listings, use_online_sources=use_online)
 
-        # Create record for database - truncate fields to prevent varchar limit errors
-        record = {
-            "section": l.section[: VARCHAR_LIMITS["section"]] if l.section else None,
-            "manufacturer": l.manufacturer[: VARCHAR_LIMITS["manufacturer"]]
-            if l.manufacturer
-            else None,
-            "model": l.model[: VARCHAR_LIMITS["model"]] if l.model else None,
-            "caliber": l.caliber[: VARCHAR_LIMITS["caliber"]] if l.caliber else None,
-            "list_price": l.price,
-            "description": l.description,  # Description might have a different limit, often TEXT type
-            "estimated_value": value_info["estimated_value"],
-            "value_source": value_info["source"][: VARCHAR_LIMITS["value_source"]]
-            if value_info["source"]
-            else None,
-            "value_confidence": value_info["confidence"],
-            "price_difference": price_difference,
-            "price_difference_percent": price_difference_percent,
-            "listing_hash": listing_hash,
-            "is_latest": True,
-            "date_scraped": current_time,
-        }
+        # Configure concurrent estimator
+        estimator = ConcurrentValueEstimator(
+            max_workers=max_workers,
+            rate_limit_delay=0.3,  # Reduced delay for better performance
+        )
 
-        # Add value range if available
-        if value_info["value_range"]:
-            record["value_range_low"] = value_info["value_range"][0]
-            record["value_range_high"] = value_info["value_range"][1]
+        # Override caching if disabled
+        if not enable_caching:
+            estimator.cache = None
 
-        # Add market listings data if available (as JSON)
-        if value_info.get("market_listings"):
-            record["market_listings_json"] = json.dumps(value_info["market_listings"])
-            record["market_listings_count"] = len(value_info["market_listings"])
+        # Progress callback
+        def progress_callback(completed: int, total: int, status: str):
+            progress_percent = int(100 * completed / total)
+            overall_progress.progress(
+                progress_percent, text=f"Processing {completed}/{total} firearms"
+            )
+            detail_progress.text(status)
 
-        db_records.append(record)
+        # Process all estimates concurrently
+        start_time = time.time()
+        results = estimator.estimate_values_batch(tasks, progress_callback)
+        processing_time = time.time() - start_time
+
+        # Show performance stats
+        successful_results = [r for r in results if r.success]
+        avg_time = (
+            sum(r.processing_time for r in successful_results) / len(successful_results)
+            if successful_results
+            else 0
+        )
+
+        st.success(
+            f"✅ Completed in {processing_time:.1f}s (avg {avg_time:.1f}s per firearm, {len(successful_results)}/{len(results)} successful)"
+        )
+
+        # Process results into database records
+        for i, listing in enumerate(listings):
+            result = results[i]
+
+            # Generate a unique hash for this listing
+            listing_hash = generate_listing_hash(listing)
+
+            if result.success and result.value_info:
+                value_info = result.value_info
+
+                # Calculate price difference if we have an estimated value
+                price_difference = None
+                price_difference_percent = None
+
+                if value_info["estimated_value"]:
+                    price_difference = listing.price - value_info["estimated_value"]
+                    price_difference_percent = (
+                        price_difference / value_info["estimated_value"]
+                    ) * 100
+
+                # Create record for database
+                record = {
+                    "section": listing.section[: VARCHAR_LIMITS["section"]]
+                    if listing.section
+                    else None,
+                    "manufacturer": listing.manufacturer[: VARCHAR_LIMITS["manufacturer"]]
+                    if listing.manufacturer
+                    else None,
+                    "model": listing.model[: VARCHAR_LIMITS["model"]] if listing.model else None,
+                    "caliber": listing.caliber[: VARCHAR_LIMITS["caliber"]]
+                    if listing.caliber
+                    else None,
+                    "list_price": listing.price,
+                    "description": listing.description,
+                    "condition": listing.condition,
+                    "estimated_value": value_info["estimated_value"],
+                    "value_source": value_info["source"][: VARCHAR_LIMITS["value_source"]]
+                    if value_info["source"]
+                    else None,
+                    "value_confidence": value_info["confidence"],
+                    "price_difference": price_difference,
+                    "price_difference_percent": price_difference_percent,
+                    "listing_hash": listing_hash,
+                    "is_latest": True,
+                    "date_scraped": current_time,
+                }
+
+                # Add value range if available
+                if value_info["value_range"]:
+                    record["value_range_low"] = value_info["value_range"][0]
+                    record["value_range_high"] = value_info["value_range"][1]
+
+                # Add market listings data if available (as JSON)
+                if value_info.get("market_listings"):
+                    record["market_listings_json"] = json.dumps(value_info["market_listings"])
+                    record["market_listings_count"] = len(value_info["market_listings"])
+
+                db_records.append(record)
+            else:
+                # Fallback for failed estimates
+                record = {
+                    "section": listing.section[: VARCHAR_LIMITS["section"]]
+                    if listing.section
+                    else None,
+                    "manufacturer": listing.manufacturer[: VARCHAR_LIMITS["manufacturer"]]
+                    if listing.manufacturer
+                    else None,
+                    "model": listing.model[: VARCHAR_LIMITS["model"]] if listing.model else None,
+                    "caliber": listing.caliber[: VARCHAR_LIMITS["caliber"]]
+                    if listing.caliber
+                    else None,
+                    "list_price": listing.price,
+                    "description": listing.description,
+                    "condition": listing.condition,
+                    "estimated_value": None,
+                    "value_source": "Estimation failed",
+                    "value_confidence": "none",
+                    "price_difference": None,
+                    "price_difference_percent": None,
+                    "listing_hash": listing_hash,
+                    "is_latest": True,
+                    "date_scraped": current_time,
+                }
+                db_records.append(record)
+
+        # Clear progress indicators
+        overall_progress.empty()
+        detail_progress.empty()
+
+    else:
+        # Use sequential processing for smaller datasets or when online sources disabled
+        progress_bar = st.progress(0)
+        total_listings = len(listings)
+
+        # Process each listing with a progress indicator
+        for i, l in enumerate(listings):
+            # Update progress bar
+            progress_percent = int(100 * (i / total_listings))
+            progress_bar.progress(
+                progress_percent,
+                text=f"Processing {i + 1}/{total_listings}: {l.manufacturer} {l.model}",
+            )
+
+            # Generate a unique hash for this listing
+            listing_hash = generate_listing_hash(l)
+
+            # Get value estimate
+            value_info = estimate_value(
+                l.manufacturer, l.model, l.caliber, use_online_sources=use_online
+            )
+
+            # Calculate price difference if we have an estimated value
+            price_difference = None
+            price_difference_percent = None
+
+            if value_info["estimated_value"]:
+                price_difference = l.price - value_info["estimated_value"]
+                price_difference_percent = (price_difference / value_info["estimated_value"]) * 100
+
+            # Create record for database - truncate fields to prevent varchar limit errors
+            record = {
+                "section": l.section[: VARCHAR_LIMITS["section"]] if l.section else None,
+                "manufacturer": l.manufacturer[: VARCHAR_LIMITS["manufacturer"]]
+                if l.manufacturer
+                else None,
+                "model": l.model[: VARCHAR_LIMITS["model"]] if l.model else None,
+                "caliber": l.caliber[: VARCHAR_LIMITS["caliber"]] if l.caliber else None,
+                "list_price": l.price,
+                "description": l.description,
+                "condition": l.condition,
+                "estimated_value": value_info["estimated_value"],
+                "value_source": value_info["source"][: VARCHAR_LIMITS["value_source"]]
+                if value_info["source"]
+                else None,
+                "value_confidence": value_info["confidence"],
+                "price_difference": price_difference,
+                "price_difference_percent": price_difference_percent,
+                "listing_hash": listing_hash,
+                "is_latest": True,
+                "date_scraped": current_time,
+            }
+
+            # Add value range if available
+            if value_info["value_range"]:
+                record["value_range_low"] = value_info["value_range"][0]
+                record["value_range_high"] = value_info["value_range"][1]
+
+            # Add market listings data if available (as JSON)
+            if value_info.get("market_listings"):
+                record["market_listings_json"] = json.dumps(value_info["market_listings"])
+                record["market_listings_count"] = len(value_info["market_listings"])
+
+            db_records.append(record)
+
+        # Clear progress bar
+        progress_bar.empty()
 
     # Insert records in batches of 50 to avoid potential size limits
     batch_size = 50
@@ -201,6 +355,9 @@ def inventory_page():
     # Create sidebar for filters
     st.sidebar.header("Filters")
 
+    # Add condition filter (new/used)
+    condition_filter = st.sidebar.radio("Condition:", ["All", "New Only", "Used Only"])
+
     # Create a dropdown for filtering
     selected_section = st.sidebar.selectbox("Select Firearm Type:", options)
 
@@ -208,6 +365,13 @@ def inventory_page():
     deal_filter = st.sidebar.radio(
         "Price Filter:", ["All Listings", "Good Deals (Below Market Value)", "Premium Priced"]
     )
+
+    # Filter by condition
+    if "condition" in df.columns:
+        if condition_filter == "New Only":
+            df = df[df["condition"] == "new"]
+        elif condition_filter == "Used Only":
+            df = df[df["condition"] == "used"]
 
     # Filter by section
     if selected_section != "All":
@@ -227,13 +391,16 @@ def inventory_page():
     )
 
     if not df.empty:
-        # Create a display-ready DataFrame
+        # Create a display-ready DataFrame with sanitized data
         display_df = pd.DataFrame(
             {
-                "Type": df["section_type"],
-                "Manufacturer": df["manufacturer"],
-                "Model": df["model"],
-                "Caliber/Gauge": df["caliber"],
+                "Condition": df["condition"].apply(lambda x: InputValidator.sanitize_for_display(x.title()) if x else "Unknown")
+                if "condition" in df.columns
+                else "Unknown",
+                "Type": df["section_type"].apply(lambda x: InputValidator.sanitize_for_display(str(x))),
+                "Manufacturer": df["manufacturer"].apply(lambda x: InputValidator.sanitize_for_display(str(x))),
+                "Model": df["model"].apply(lambda x: InputValidator.sanitize_for_display(str(x))),
+                "Caliber/Gauge": df["caliber"].apply(lambda x: InputValidator.sanitize_for_display(str(x))),
                 "List Price": df["list_price"].apply(lambda x: f"${x:,.2f}" if x else "N/A"),
                 "Est. Market Value": df["estimated_value"].apply(
                     lambda x: f"${x:,.2f}" if x else "No data"
@@ -244,8 +411,8 @@ def inventory_page():
                     else "N/A",
                     axis=1,
                 ),
-                "Value Source": df["value_source"].fillna("N/A"),
-                "Description": df["description"],
+                "Value Source": df["value_source"].fillna("N/A").apply(lambda x: InputValidator.sanitize_for_display(str(x))),
+                "Description": df["description"].apply(lambda x: InputValidator.sanitize_for_display(str(x)) if x else ""),
             }
         )
 
@@ -662,17 +829,21 @@ def analytics_page():
 
 
 def main():
-    st.set_page_config(page_title="Elk River Used Guns Inventory", layout="wide")
+    st.set_page_config(page_title="Elk River Guns Inventory Tracker", layout="wide")
 
     # Add a title and description
-    st.title("Elk River Used Guns Inventory")
+    st.title("Elk River Guns Inventory Tracker")
     st.markdown(
-        "This app tracks inventory and estimates market values for used firearms at Elk River Guns."
+        "This app tracks inventory and estimates market values for both new and used firearms at Elk River Guns."
     )
     st.markdown(
-        "This app is not affiliated with Elk River Guns. It is a personal project to help track the market value of used firearms."
+        "This app is not affiliated with Elk River Guns. It is a personal project to help track the market value of firearms."
     )
-    st.link_button("Elk River Guns", "https://elkriverguns.com/used-guns")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.link_button("Used Guns", "https://elkriverguns.com/used-guns")
+    with col2:
+        st.link_button("New Guns", "https://elkriverguns.com/new-guns")
     # Check when data was last scraped
     last_scrape_time = get_last_scrape_time()
 
@@ -710,6 +881,33 @@ def main():
     # Determine if we need to fetch new data
     needs_update = refresh or not last_scrape_time
 
+    # Show performance settings BEFORE the data refresh process (outside any containers)
+    if needs_update and st.session_state.get("use_online_sources", False):
+        st.subheader("⚙️ Processing Configuration")
+        with st.expander("🚀 Performance Settings", expanded=False):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                max_workers = st.number_input(
+                    "Concurrent Workers",
+                    min_value=1,
+                    max_value=8,
+                    value=4,
+                    help="More workers = faster processing, but higher server load",
+                )
+            with col2:
+                enable_caching = st.checkbox(
+                    "Enable Caching", value=True, help="Cache online lookups to avoid repeated searches"
+                )
+            with col3:
+                if st.button("Clear Cache"):
+                    cache = get_market_cache()
+                    cleared = cache.clear_expired()
+                    st.success(f"Cleared {cleared} expired cache entries")
+    else:
+        # Default values when not showing UI
+        max_workers = 4
+        enable_caching = True
+
     # If data needs to be refreshed, scrape new data
     if needs_update:
         # Create a status container to show overall progress
@@ -727,8 +925,8 @@ def main():
                 if percent >= 100:
                     time.sleep(0.5)  # Give a moment to see 100%
 
-            # Scrape new data with progress updates
-            listings = scrape_used_guns(progress_callback=update_scrape_progress)
+            # Scrape new data with progress updates (both new and used guns)
+            listings = scrape_all_guns(progress_callback=update_scrape_progress)
 
             if listings:
                 # Update status for the next phase
@@ -740,9 +938,9 @@ def main():
                 # Remove the scraping progress bar and add a message about found firearms
                 scrape_progress_bar.empty()
                 st.success(f"Found {len(listings)} firearms at Elk River Guns")
-
+                
                 # Process data and store in database
-                total_stored = store_listings(listings)
+                total_stored = store_listings(listings, max_workers, enable_caching)
 
                 # Update status one more time
                 status.update(label="Step 3/3: Finalizing database update...", state="running")

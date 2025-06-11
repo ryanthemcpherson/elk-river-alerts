@@ -5,13 +5,43 @@ import urllib.parse
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from validation import validate_search_params
 
 
-def search_armslist(manufacturer, model, caliber, location="usa", category="all"):
+def search_armslist(manufacturer, model, caliber, location="usa", category="all", timeout=15, max_retries=2):
     """
     Search Armslist for current listings matching the firearm details
-    Returns a list of dictionaries with listing information
+    
+    Args:
+        manufacturer: Firearm manufacturer
+        model: Firearm model
+        caliber: Firearm caliber
+        location: Search location (default: "usa")
+        category: Search category (default: "all")
+        timeout: Request timeout in seconds
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        List of dictionaries with listing information
+        
+    Raises:
+        requests.RequestException: If network request fails after retries
+        ValueError: If search parameters are invalid
     """
+    # Validate and clean input parameters
+    validation_result = validate_search_params(manufacturer, model, caliber)
+    if not validation_result.is_valid:
+        raise ValueError(f"Invalid search parameters: {validation_result.error_message}")
+    
+    # Use cleaned parameters
+    cleaned_params = validation_result.cleaned_value
+    manufacturer = cleaned_params['manufacturer']
+    model = cleaned_params['model']
+    caliber = cleaned_params['caliber']
+    
     try:
         # Build the search query
         search_query = f"{manufacturer} {model} {caliber}".strip()
@@ -24,138 +54,259 @@ def search_armslist(manufacturer, model, caliber, location="usa", category="all"
 
         print(f"Searching Armslist for: {search_query}")
         print(f"URL: {url}")
+        
+        # Configure session with retry strategy
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=max_retries,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
 
         # Set headers to mimic a browser request
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate",
             "DNT": "1",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
         }
 
-        # Send the request to Armslist
-        response = requests.get(url, headers=headers, timeout=10)
+        try:
+            # Send the request to Armslist
+            response = session.get(url, headers=headers, timeout=timeout)
+            response.raise_for_status()  # Raises HTTPError for bad responses
+            
+            if not response.text.strip():
+                print(f"Warning: Empty response from Armslist for {search_query}")
+                return []
+                
+        except requests.exceptions.Timeout:
+            raise requests.RequestException(f"Armslist request timeout after {timeout} seconds")
+        except requests.exceptions.ConnectionError:
+            raise requests.RequestException(f"Connection error when accessing Armslist")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                raise requests.RequestException(f"Rate limited by Armslist (HTTP 429)")
+            elif e.response.status_code in [500, 502, 503, 504]:
+                raise requests.RequestException(f"Armslist server error (HTTP {e.response.status_code})")
+            else:
+                raise requests.RequestException(f"HTTP error {e.response.status_code} from Armslist")
+        except requests.exceptions.RequestException as e:
+            raise requests.RequestException(f"Request failed for Armslist: {e}")
+        finally:
+            session.close()
 
-        # Check if the request was successful
-        if response.status_code != 200:
-            print(f"Error: Received status code {response.status_code}")
-            return []
-
-        # Parse the HTML content
-        soup = BeautifulSoup(response.text, "html.parser")
+        try:
+            # Parse the HTML content
+            soup = BeautifulSoup(response.text, "html.parser")
+        except Exception as e:
+            raise ValueError(f"Failed to parse HTML response from Armslist: {e}")
 
         # Find all listing items
         listings = []
 
-        # The search results appear to be in sections for "Near Match Records" and "Related Match Records"
-        # Look for listing elements that have class attributes consistent with listings
-        listing_elements = soup.find_all("div", class_=lambda c: c and "listing" in c.lower())
+        try:
+            # The search results appear to be in sections for "Near Match Records" and "Related Match Records"
+            # Look for listing elements that have class attributes consistent with listings
+            listing_elements = soup.find_all("div", class_=lambda c: c and "listing" in c.lower())
 
-        if not listing_elements:
-            # Fall back to a more generic approach if class-based search fails
-            listing_elements = soup.find_all(
-                "div", class_=lambda c: c and ("item" in c.lower() or "product" in c.lower())
-            )
-
-        for item in listing_elements:
-            try:
-                # Extract listing data
-                title_element = item.find("h3") or item.find("h2")
-                title = title_element.text.strip() if title_element else "No Title"
-
-                # Try to find the price
-                price_element = item.find(
-                    "span", class_=lambda c: c and "price" in c.lower()
-                ) or item.find("div", class_=lambda c: c and "price" in c.lower())
-                price_text = price_element.text.strip() if price_element else "Price not listed"
-
-                # Clean up the price text and convert to float if possible
-                price = None
-                if price_text and "$" in price_text:
-                    price_str = re.sub(r"[^\d.]", "", price_text)
-                    try:
-                        price = float(price_str)
-                    except ValueError:
-                        price = None
-
-                # Try to find the link
-                link_element = item.find("a", href=True)
-                link = (
-                    "https://www.armslist.com" + link_element["href"]
-                    if link_element and link_element.get("href", "").startswith("/")
-                    else link_element.get("href", "#")
-                    if link_element
-                    else "#"
+            if not listing_elements:
+                # Fall back to a more generic approach if class-based search fails
+                listing_elements = soup.find_all(
+                    "div", class_=lambda c: c and ("item" in c.lower() or "product" in c.lower())
                 )
 
-                # Try to find the location
-                location_element = item.find("div", class_=lambda c: c and "location" in c.lower())
-                location = (
-                    location_element.text.strip() if location_element else "Location not specified"
-                )
+            for item in listing_elements:
+                try:
+                    # Extract listing data with error handling for each field
+                    title_element = item.find("h3") or item.find("h2")
+                    title = title_element.text.strip() if title_element else "No Title"
 
-                # Try to find if it will ship
-                ships_element = item.find("span", class_=lambda c: c and "ship" in c.lower())
-                ships = (
-                    True
-                    if ships_element and ships_element.text.strip().lower() == "will ship"
-                    else False
-                )
+                    # Try to find the price
+                    price_element = item.find(
+                        "span", class_=lambda c: c and "price" in c.lower()
+                    ) or item.find("div", class_=lambda c: c and "price" in c.lower())
+                    price_text = price_element.text.strip() if price_element else "Price not listed"
 
-                # Compile the listing data
-                listing = {
-                    "title": title,
-                    "price": price,
-                    "price_text": price_text,
-                    "link": link,
-                    "location": location,
-                    "ships": ships,
-                    "source": "Armslist",
-                }
+                    # Clean up the price text and convert to float if possible
+                    price = None
+                    if price_text and "$" in price_text:
+                        price_str = re.sub(r"[^\d.]", "", price_text)
+                        try:
+                            price = float(price_str)
+                            # Validate price is reasonable (between $10 and $50,000)
+                            if price < 10 or price > 50000:
+                                price = None
+                        except (ValueError, TypeError):
+                            price = None
 
-                listings.append(listing)
-            except Exception as e:
-                print(f"Error parsing listing: {e}")
-                continue
+                    # Try to find the link
+                    link_element = item.find("a", href=True)
+                    link = (
+                        "https://www.armslist.com" + link_element["href"]
+                        if link_element and link_element.get("href", "").startswith("/")
+                        else link_element.get("href", "#")
+                        if link_element
+                        else "#"
+                    )
 
-        print(f"Found {len(listings)} listings on Armslist")
-        return listings
+                    # Try to find the location
+                    location_element = item.find("div", class_=lambda c: c and "location" in c.lower())
+                    location = (
+                        location_element.text.strip() if location_element else "Location not specified"
+                    )
 
+                    # Try to find if it will ship
+                    ships_element = item.find("span", class_=lambda c: c and "ship" in c.lower())
+                    ships = (
+                        True
+                        if ships_element and ships_element.text.strip().lower() == "will ship"
+                        else False
+                    )
+
+                    # Compile the listing data
+                    listing = {
+                        "title": title,
+                        "price": price,
+                        "price_text": price_text,
+                        "link": link,
+                        "location": location,
+                        "ships": ships,
+                        "source": "Armslist",
+                    }
+
+                    listings.append(listing)
+                except Exception as e:
+                    # Log parsing error but continue with other listings
+                    print(f"Warning: Error parsing individual listing: {e}")
+                    continue
+
+            print(f"Found {len(listings)} listings on Armslist")
+            return listings
+            
+        except Exception as e:
+            # If parsing completely fails, log and return empty list
+            print(f"Warning: Failed to parse Armslist response: {e}")
+            return []
+
+    except requests.RequestException:
+        # Re-raise network-related exceptions
+        raise
+    except ValueError:
+        # Re-raise validation exceptions
+        raise
     except Exception as e:
-        print(f"Error searching Armslist: {e}")
-        return []
+        # Catch any other unexpected errors
+        raise requests.RequestException(f"Unexpected error searching Armslist: {e}")
 
 
-def get_market_listings(manufacturer, model, caliber):
+def get_market_listings(manufacturer, model, caliber, use_cache=True, timeout=15, max_retries=2):
     """
     Get current market listings from various sources
-    Returns a list of dictionaries with listing information
+    
+    Args:
+        manufacturer: Firearm manufacturer
+        model: Firearm model
+        caliber: Firearm caliber
+        use_cache: Whether to use caching
+        timeout: Request timeout in seconds
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        List of dictionaries with listing information
+        
+    Raises:
+        ValueError: If input parameters are invalid
+        requests.RequestException: If network requests fail
     """
-    # Add a small delay to prevent aggressive scraping
-    time.sleep(random.uniform(0.5, 1.5))
+    # Validate and clean input parameters
+    validation_result = validate_search_params(manufacturer, model, caliber)
+    if not validation_result.is_valid:
+        raise ValueError(f"Invalid search parameters: {validation_result.error_message}")
+    
+    # Use cleaned parameters
+    cleaned_params = validation_result.cleaned_value
+    manufacturer = cleaned_params['manufacturer']
+    model = cleaned_params['model']
+    caliber = cleaned_params['caliber']
+    
+    # Try cache first if enabled
+    if use_cache:
+        try:
+            from cache_manager import get_market_cache
 
-    # Search Armslist
-    armslist_results = search_armslist(manufacturer, model, caliber)
+            cache = get_market_cache()
+            cached_listings = cache.get(manufacturer, model, caliber)
+            if cached_listings is not None:
+                print(f"Using cached listings for {manufacturer} {model} {caliber}")
+                return cached_listings
+        except ImportError:
+            print("Warning: Cache not available, continuing without cache")
+        except Exception as e:
+            print(f"Warning: Cache error: {e}, continuing without cache")
+
+    # Add a small delay to prevent aggressive scraping (reduced from 0.5-1.5s)
+    time.sleep(random.uniform(0.2, 0.8))
+
+    try:
+        # Search Armslist with error handling
+        armslist_results = search_armslist(manufacturer, model, caliber, timeout=timeout, max_retries=max_retries)
+    except requests.RequestException as e:
+        print(f"Network error searching Armslist: {e}")
+        armslist_results = []
+    except ValueError as e:
+        print(f"Validation error searching Armslist: {e}")
+        armslist_results = []
+    except Exception as e:
+        print(f"Unexpected error searching Armslist: {e}")
+        armslist_results = []
 
     # Combine results from different sources (currently just Armslist)
     all_listings = armslist_results
 
-    # Sort listings by price (lowest first)
+    # Sort listings by price (lowest first) with error handling
     if all_listings:
-        all_listings = sorted(
-            [l for l in all_listings if l.get("price") is not None], key=lambda x: x["price"]
-        )
-
-        # Calculate average price if we have enough data
-        if len(all_listings) >= 3:
-            prices = [l.get("price") for l in all_listings if l.get("price") is not None]
-            avg_price = sum(prices) / len(prices) if prices else None
-
-            # Add average price to the results
+        try:
+            # Filter out listings with invalid prices
+            valid_listings = []
             for listing in all_listings:
-                listing["avg_price"] = avg_price
+                price = listing.get("price")
+                if price is not None and isinstance(price, (int, float)) and price > 0:
+                    valid_listings.append(listing)
+            
+            all_listings = sorted(valid_listings, key=lambda x: x["price"])
+
+            # Calculate average price if we have enough data
+            if len(all_listings) >= 3:
+                prices = [l.get("price") for l in all_listings if l.get("price") is not None]
+                if prices:
+                    avg_price = sum(prices) / len(prices)
+                    # Add average price to the results
+                    for listing in all_listings:
+                        listing["avg_price"] = avg_price
+        except Exception as e:
+            print(f"Warning: Error processing listings: {e}")
+            # Continue with unsorted listings
+
+    # Cache the results if caching is enabled
+    if use_cache and all_listings:
+        try:
+            from cache_manager import get_market_cache
+
+            cache = get_market_cache()
+            cache.set(manufacturer, model, caliber, all_listings)
+            print(f"Cached {len(all_listings)} listings for {manufacturer} {model} {caliber}")
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"Warning: Failed to cache results: {e}")
 
     return all_listings
 
@@ -309,9 +460,22 @@ def estimate_value(manufacturer, model, caliber, use_online_sources=False):
     - model: The firearm model
     - caliber: The firearm caliber
     - use_online_sources: Whether to also search online marketplaces for current listings
+    
+    Raises:
+        ValueError: If input parameters are invalid
     """
-    # Add a small delay to simulate processing
-    time.sleep(random.uniform(0.2, 0.5))
+    # Validate input parameters
+    validation_result = validate_search_params(manufacturer, model, caliber)
+    if not validation_result.is_valid:
+        raise ValueError(f"Invalid parameters for value estimation: {validation_result.error_message}")
+    
+    # Use cleaned parameters
+    cleaned_params = validation_result.cleaned_value
+    manufacturer = cleaned_params['manufacturer']
+    model = cleaned_params['model']
+    caliber = cleaned_params['caliber']
+    # Minimal delay for rate limiting (reduced from 0.2-0.5s)
+    time.sleep(random.uniform(0.05, 0.1))
 
     # Minimum acceptable value for any firearm to prevent negative prices
     MIN_VALUE = 50.0

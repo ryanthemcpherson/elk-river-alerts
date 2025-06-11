@@ -212,6 +212,44 @@ def increase_varchar_limits():
     )
 
 
+def add_condition_column():
+    """Add condition column to track new vs used firearms"""
+    print("Connecting to Supabase...")
+    supabase = get_connection()
+
+    print("Checking if condition column already exists...")
+
+    condition_exists = False
+
+    try:
+        # Query a single record
+        result = supabase.table("firearm_listings").select("condition").limit(1).execute()
+        if "condition" in str(result):
+            condition_exists = True
+            print("condition column already exists")
+    except:
+        pass
+
+    # Add column if it doesn't exist
+    if not condition_exists:
+        print("Adding condition column...")
+        try:
+            print("Please add the 'condition' column manually through the Supabase console.")
+            print(
+                "SQL: ALTER TABLE firearm_listings ADD COLUMN IF NOT EXISTS condition VARCHAR(10) DEFAULT 'used';"
+            )
+        except Exception as e:
+            print(f"Error adding condition column: {e}")
+
+    print("\nCondition column migration completed.")
+    print("\nIMPORTANT: Please make sure you have the condition column in your Supabase database:")
+    print("1. condition (VARCHAR(10)): Tracks whether the firearm is 'new' or 'used'")
+
+    print(
+        "\nIf the automatic migration didn't work, please add this column manually through the Supabase console."
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Database migration for Elk River Guns Inventory Tracker"
@@ -225,6 +263,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--increase-varchar-limits", action="store_true", help="Increase varchar column size limits"
     )
+    parser.add_argument(
+        "--add-condition-column",
+        action="store_true",
+        help="Add condition column for new/used tracking",
+    )
 
     args = parser.parse_args()
 
@@ -234,5 +277,7 @@ if __name__ == "__main__":
         add_market_listings_columns()
     elif args.increase_varchar_limits:
         increase_varchar_limits()
+    elif args.add_condition_column:
+        add_condition_column()
     else:
         parser.print_help()

@@ -84,4 +84,35 @@ def test_specific_firearm(manufacturer, model, caliber):
 
 
 if __name__ == "__main__":
+    # Test the new scraping functionality too
+    print("\n" + "=" * 60)
+    print("Testing New vs Used Gun Scraping")
+    print("=" * 60)
+
+    from main import scrape_guns_from_url
+
+    try:
+        # Test scraping just new guns
+        new_guns = scrape_guns_from_url("https://elkriverguns.com/new-guns/", "new")
+        print(f"Found {len(new_guns)} new guns")
+
+        # Test scraping just used guns
+        used_guns = scrape_guns_from_url("https://elkriverguns.com/used-guns/", "used")
+        print(f"Found {len(used_guns)} used guns")
+
+        if new_guns and used_guns:
+            print(
+                f"\nExample new gun: {new_guns[0].manufacturer} {new_guns[0].model} - {new_guns[0].condition}"
+            )
+            print(
+                f"Example used gun: {used_guns[0].manufacturer} {used_guns[0].model} - {used_guns[0].condition}"
+            )
+
+    except Exception as e:
+        print(f"Error testing scraping: {e}")
+
+    print("\n" + "=" * 60)
+    print("Testing Value Estimation")
+    print("=" * 60)
+
     main()

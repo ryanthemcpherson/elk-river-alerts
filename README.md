@@ -1,20 +1,20 @@
 # Elk River Guns Inventory Tracker
 
-A simple application that scrapes and displays the used gun inventory from Elk River Guns website, with market value estimation for each firearm.
+A comprehensive application that scrapes and displays both new and used gun inventory from Elk River Guns website, with market value estimation for each firearm.
 
 ## Features
 
-- Scrapes real-time data from the Elk River Guns used guns page
-- Displays inventory in a clean, filterable table
-- Filter by firearm type (Pistols, Rifles, Revolvers, Shotguns)
+- **Comprehensive Inventory Tracking**: Scrapes real-time data from both new and used guns pages
+- **Smart Filtering**: Filter by condition (new/used), firearm type (Pistols, Rifles, Revolvers, Shotguns), and pricing
 - **Market Value Estimation**: Provides estimated market values for each firearm
-- Compare listing prices to market values to identify potential deals
-- See value ranges and sources for each estimate
+- **Deal Identification**: Compare listing prices to market values to identify potential deals
+- **Value Insights**: See value ranges and sources for each estimate
 - **Analytics Dashboard**: View price trends, inventory composition, and top deals
-- Interactive charts and visualizations for market analysis
-- Highlights best value firearms across different categories
-- **Historical Price Tracking**: Tracks price changes over time 
+- **Interactive Visualizations**: Charts and graphs for market analysis
+- **Best Value Highlighting**: Automatically identifies the best value firearms across different categories
+- **Historical Price Tracking**: Tracks price changes over time for trend analysis
 - **Duplicate Prevention**: Smart detection and handling of duplicate listings
+- **Condition Tracking**: Separate new and used firearms with clear indicators
 
 ## Installation
 
