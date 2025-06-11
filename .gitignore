@@ -2,3 +2,6 @@
 /rio_app.py
 /__pycache__
 .streamlit/secrets.toml
+.claude
+*.md
+!README.md

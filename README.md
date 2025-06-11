@@ -29,6 +29,11 @@ A simple application that scrapes and displays the used gun inventory from Elk R
    ```
    pip install -r requirements.txt
    ```
+4. (Optional) Install development dependencies for linting:
+   ```
+   pip install -r requirements-dev.txt
+   pre-commit install  # Enables automatic linting before commits
+   ```
 
 ## Usage
 
@@ -88,6 +93,29 @@ Additional options:
   python test_firearm_values.py --manufacturer "GLOCK" --model "19" --caliber "9MM"
   ```
 
+## Development
+
+### Code Quality
+
+This project uses `ruff` for linting and code formatting:
+
+```bash
+# Run linting checks
+make lint
+
+# Auto-fix issues and format code
+make fix
+
+# Run tests
+make test
+```
+
+### GitHub Actions
+
+The project includes GitHub Actions workflows for:
+- **Automatic linting** on push and pull requests
+- **Manual code formatting** via workflow dispatch
+
 ## Project Structure
 
 - `main.py` - Web scraping functionality using BeautifulSoup
@@ -95,7 +123,12 @@ Additional options:
 - `firearm_values.py` - Firearm market value estimation module
 - `price_analysis.py` - Market analysis and price trend functionality
 - `test_firearm_values.py` - Test script for the value estimation module
+- `test_armslist_search.py` - Test script for Armslist integration
+- `db_migration.py` - Database migration utilities
 - `requirements.txt` - Project dependencies
+- `requirements-dev.txt` - Development dependencies (linting, testing)
+- `Makefile` - Common development commands
+- `.github/workflows/` - CI/CD workflows
 
 ## Requirements
 
